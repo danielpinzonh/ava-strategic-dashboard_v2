@@ -1,0 +1,2 @@
+# This line prevents your secrets from being uploaded to GitHub
+.streamlit/secrets.toml
