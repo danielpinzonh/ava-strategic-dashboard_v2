@@ -1,2 +1,5 @@
 # This line prevents your secrets from being uploaded to GitHub
 .streamlit/secrets.toml
+
+# Ignore the old source directory
+src/
