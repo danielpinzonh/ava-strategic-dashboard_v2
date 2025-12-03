@@ -3,3 +3,5 @@
 
 # Ignore the old source directory
 src/
+results/gemini_classification
+
