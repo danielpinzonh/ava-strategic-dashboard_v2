@@ -57,42 +57,40 @@ def get_snowflake_connection():
     )
     return conn
 
-# Get the connection. This will now be reliable.
-conn = get_snowflake_connection()
-
 @st.cache_data
 def load_data():
-    # Query data from Snowflake. Note the quotes around "Date" and "Document titles".
-    # BEST PRACTICE: Explicitly list columns instead of using SELECT *.
-    # This prevents errors from column reordering and ensures you only pull the data you need.
-    query = """
-    SELECT
-        "User_Identifier",
-        "Date",
-        "Document titles",
-        "Abstention",
-        "session_number_by_user",
-        "num_documents",
-        "Language",
-        "Query_en",
-        "relevance",
-        "L0_cross_cutting",
-        "pillar_level_1",
-        "pillar_level_2",
-        "pillar_level_3",
-        "L1_theme",
-        "L2_sub_topic",
-        "L3_standardized_topic",
-        "intent",
-        "region_cleaned"
-    FROM AVA_TEST_RESULTS
-    """
-    # Since we are using a raw snowflake connection, we use pandas to execute the query.
-    # This is the equivalent of conn.query()
-    cursor = conn.cursor()
-    cursor.execute(query)
-    df = cursor.fetch_pandas_all()
-    cursor.close()
+    # Robustly check if the app is running on Streamlit Community Cloud by checking
+    # for an environment variable that is specific to the cloud platform.
+    import os
+    is_cloud = os.getenv('STREAMLIT_SERVER_RUN_ON_SAVE', 'false') == 'true'
+    if is_cloud:
+        st.sidebar.success("☁️ Running in Cloud Mode (Snowflake)")
+        # --- Production Mode: Connect to Snowflake ---
+        query = """
+        SELECT
+            "User_Identifier", "Date", "Document titles", "Abstention",
+            "session_number_by_user", "num_documents", "Language", "Query_en",
+            "relevance", "L0_cross_cutting", "pillar_level_1", "pillar_level_2",
+            "pillar_level_3", "L1_theme", "L2_sub_topic", "L3_standardized_topic",
+            "intent", "region_cleaned"
+        FROM AVA_TEST_RESULTS
+        """
+        # Get the connection only when in cloud mode
+        conn = get_snowflake_connection()
+        
+        cursor = conn.cursor()
+        cursor.execute(query)
+        df = cursor.fetch_pandas_all()
+        cursor.close()
+    else:
+        st.sidebar.warning("💻 Running in Local Mode (using CSV)")
+        # --- Local Dev Mode: Use local CSV to avoid costs ---
+        try:
+            # Use the correct path to your local CSV file
+            df = pd.read_csv("results/gemini_classification/ava_test_results_900_rows.csv")
+        except FileNotFoundError:
+            st.error("`results/gemini_classification/ava_test_results_900_rows.csv` not found. Please ensure the file exists to run in local mode.")
+            st.stop()
 
     # Snowflake column names are uppercase by default. Let's make them lowercase for consistency.
     df.columns = [col.lower() for col in df.columns]
@@ -100,7 +98,11 @@ def load_data():
     # --- PRE-PROCESSING ---
     
     # 1. Date Parsing
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    # Coerce errors will create NaT (Not a Time) for unparseable dates.
+    df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
+    
+    # Drop rows where date parsing failed to prevent downstream errors.
+    df.dropna(subset=['date'], inplace=True)
     
     # Ensure 'num_documents' is numeric before use
     if 'num_documents' in df.columns:
@@ -111,7 +113,7 @@ def load_data():
         df['session_number_by_user'] = pd.to_numeric(df['session_number_by_user'], errors='coerce').fillna(0)
 
     # Ensure 'Abstention' is a proper boolean for calculations
-    if 'Abstention' in df.columns:
+    if 'abstention' in df.columns:
         df['abstention'] = df['abstention'].astype(str).str.lower() == 'true'
 
     # 2. Coverage Score Calculation (The Supply Logic)
@@ -211,6 +213,11 @@ except Exception as e:
 # 2. SIDEBAR FILTERS (Global Scope)
 # ==========================================
 st.sidebar.header("🔍 Global Filters")
+
+# Handle case where the dataframe might be empty after cleaning
+if df_raw.empty:
+    st.warning("No valid data available for the selected time period after cleaning. Please check the data source.")
+    st.stop()
 
 # A. Date Range
 min_date = df_raw['date'].min()
