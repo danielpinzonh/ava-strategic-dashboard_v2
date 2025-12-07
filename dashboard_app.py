@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import snowflake.connector
-from snowflake.snowpark.context import get_active_session # Import the native session handler
+from snowflake.snowpark import Session
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
@@ -49,15 +49,31 @@ def check_password():
 if not check_password():
     st.stop()  # Do not continue if check_password is not True.
 
+@st.cache_resource
+def create_snowpark_session():
+    """
+    Creates a Snowpark session for local development using credentials from secrets.toml.
+    This is cached to avoid creating a new session on every rerun.
+    """
+    return Session.builder.configs(st.secrets["snowflake"]).create()
+
 @st.cache_data
 def load_data():
     """
-    Loads data from the AVA_TEST_RESULTS table in Snowflake using the app's native session.
-    This is the recommended method for apps running inside Snowflake as it avoids
-    network policies and uses the existing authenticated session.
+    Loads data from Snowflake using a hybrid approach.
+    - In Snowflake: Uses the automatically provided active session.
+    - Locally: Creates a new session using credentials from secrets.toml.
     """
     st.sidebar.info("📊 Loading data from Snowflake...")
-    session = get_active_session()
+    
+    try:
+        # This will succeed when the app is running in Snowflake
+        from snowflake.snowpark.context import get_active_session
+        session = get_active_session()
+    except Exception:
+        # This will be triggered when running locally
+        session = create_snowpark_session()
+
     query = "SELECT * FROM AVA_TEST_RESULTS;"
     # Use the Snowpark session to directly execute SQL and fetch as a Pandas DataFrame
     df = session.sql(query).to_pandas()
@@ -66,29 +82,59 @@ def load_data():
     # Snowflake column names are often uppercase. We need to standardize them.
     # Create a mapping from the SQL column names to the Python-friendly names used in the app.
     column_mapping = {
-        'Query_en': 'query_en',
+        'query_en': 'query_en',
         'relevance': 'relevance',
         'intent': 'intent',
-        'L0_cross_cutting': 'l0_cross_cutting',
-        'L1_theme': 'l1_theme',
-        'L2_sub_topic': 'l2_sub_topic',
-        'L3_standardized_topic': 'l3_standardized_topic',
+        'l0_cross_cutting': 'l0_cross_cutting',
+        'l1_theme': 'l1_theme',
+        'l2_sub_topic': 'l2_sub_topic',
+        'l3_standardized_topic': 'l3_standardized_topic',
         'pillar_level_1': 'pillar_level_1',
         'pillar_level_2': 'pillar_level_2',
         'pillar_level_3': 'pillar_level_3',
         'region_cleaned': 'region_cleaned',
-        'Date': 'date',
-        'User_Identifier': 'user_identifier',
+        'date': 'date',
+        'user_identifier': 'user_identifier',
         'session_number_by_user': 'session_number_by_user',
-        'Abstention': 'abstention',
+        'abstention': 'abstention',
         'num_documents': 'num_documents',
-        'Document titles': 'document titles',
-        'Language': 'language'
+        'document titles': 'document titles',
+        'language': 'language'
     }
-    df = df.rename(columns={k.upper(): v for k, v in column_mapping.items()})
+    
+    # --- Robust Column Renaming ---
+    # Create a case-insensitive mapping from the expected columns to the desired new names.
+    # This prevents errors if the source columns in Snowflake are uppercase, lowercase, or mixed case.
+    rename_map = {col: column_mapping.get(col.lower()) for col in df.columns if col.lower() in column_mapping}
+    # The above line creates a dictionary like {'DATE': 'date', 'QUERY_EN': 'query_en', ...}
+    # by checking the lowercase version of each actual column name against the mapping keys.
+    df = df.rename(columns=rename_map)
 
     # Convert data types for plotting and analysis
     df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
+    
+    # --- ROBUSTNESS FIX: Ensure key columns are the correct type ---
+    # Convert columns that should be numeric, handling potential errors by coercing to NaN and filling with 0.
+    if 'session_number_by_user' in df.columns:
+        df['session_number_by_user'] = pd.to_numeric(df['session_number_by_user'], errors='coerce').fillna(0)
+    if 'num_documents' in df.columns:
+        df['num_documents'] = pd.to_numeric(df['num_documents'], errors='coerce').fillna(0)
+    
+    # --- LOGIC MIGRATION: Calculate coverage_score ---
+    # This logic was previously only in preprocess_data.py. It must be here
+    # to ensure the column exists when data is loaded directly from Snowflake.
+    if 'abstention' in df.columns:
+        df['abstention'] = df['abstention'].astype(str).str.lower() == 'true'
+
+    def get_coverage(row):
+        if row.get('abstention') or row.get('num_documents', 0) == 0: return 0.0
+        flagships = ['WDR', 'Global Economic Prospects', 'Poverty Assessment', 'CEM']
+        titles = str(row.get('document titles', '')).lower() # Use the renamed column
+        if row.get('num_documents', 0) >= 4 or any(x.lower() in titles for x in flagships): return 2.0
+        return 1.0
+    
+    df['coverage_score'] = df.apply(get_coverage, axis=1)
+
     df.dropna(subset=['date'], inplace=True)
     st.sidebar.success("✅ Data loaded successfully!")
     return df
@@ -142,7 +188,10 @@ if 'region_cleaned' in df_raw.columns and df_raw['region_cleaned'].nunique() > 1
     
     # Separate regions from countries
     regions_list = sorted([r for r in unique_regions if r in WB_REGIONS])
-    countries_list = sorted([r for r in unique_regions if r not in WB_REGIONS and r not in ['All', 'Global', 'Unknown']])
+    # --- ROBUSTNESS FIX: Filter out None values before sorting ---
+    # The 'unique_regions' list can contain None if the source data has NULLs.
+    # We must explicitly check `if r` to ensure we only process valid strings.
+    countries_list = sorted([r for r in unique_regions if r and r not in WB_REGIONS and r not in ['All', 'Global', 'Unknown']])
     
     all_regions = ['All', 'Global'] + regions_list + countries_list
     
